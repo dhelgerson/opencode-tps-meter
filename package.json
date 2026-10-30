@@ -1,0 +1,25 @@
+{
+  "name": "opencode-tps-meter",
+  "version": "1.0.0",
+  "description": "Tokens-per-second badge for OpenCode Desktop session headers: live estimate while the model writes, exact turn rate once it settles.",
+  "type": "module",
+  "exports": {
+    "./gui-experimental": "./gui-experimental.cjs"
+  },
+  "files": [
+    "gui-experimental.cjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tps",
+    "tokens-per-second",
+    "desktop"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dhelgerson/opencode-tps-meter.git"
+  }
+}
