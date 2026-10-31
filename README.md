@@ -8,23 +8,36 @@ One file, no build step, no dependencies.
 
 ## Install
 
-From a public or private Git host (branches, tags, and commit hashes work as
-`#refs`):
+Requires OpenCode Desktop 2.x. (The badge is Desktop-only; the TUI shows
+nothing.) Ask an agent or yourself to run one command:
 
 ```sh
 opencode plugin add github:dhelgerson/opencode-tps-meter
 ```
 
-Or add it to the global config directly. The desktop app reads plugins only
-from the **global** `opencode.json(c)`, so put it there to get the badge in
-every window:
+That installs it globally and registers it in the global config. The desktop
+app reads plugins **only** from the global `opencode.json(c)` — never from a
+project config — so if you configure it by hand instead, edit
+`~/.config/opencode/opencode.json` and *merge into* the existing JSON object:
+add the entry to its `plugins` array (create the array if absent) and keep
+every other key the file already has. Do not replace the file with this
+snippet:
 
 ```jsonc
-// ~/.config/opencode/opencode.json
+// ~/.config/opencode/opencode.json — merge, don't overwrite
 {
   "plugins": ["github:dhelgerson/opencode-tps-meter"],
 }
 ```
+
+The change is picked up as the config is watched; otherwise restart OpenCode
+Desktop.
+
+**Verify:** send any prompt — the session header should show `… t/s` while the
+model writes. If it does not, open **Settings ▸ Extensions ▸ Plugins** (with
+the app's own server selected): `opencode-tps-meter` must be listed and
+enabled; **Reload** re-reads it after an edit or a failure. A row saying
+"Failed" or "Not loaded" means the bundle or the id has a problem.
 
 For a local copy instead of a repository, point the same entry at the folder —
 a directory holding just `gui-experimental.cjs` is a complete package:
@@ -35,10 +48,9 @@ a directory holding just `gui-experimental.cjs` is a complete package:
 
 Editing a local plugin reloads its GUI in place. An installed package changes
 only when its version does, after `opencode plugin update` (or an app restart):
-every release needs a new `version` in `package.json`.
-
-**Settings ▸ Extensions ▸ Plugins** lists the plugin with a switch that turns
-its desktop UI off; **Reload** re-reads it after an edit or a failure.
+every release needs a new `version` in `package.json`. Branches, tags, and
+commit hashes pin via a `#ref` suffix — `github:...#v1.0.0` stays frozen until
+the entry changes, `#main` tracks the branch.
 
 ## What the number means
 
@@ -67,7 +79,10 @@ rougher than the ones after it.
 Add these to the plugin's entry in the config to change the defaults:
 
 ```jsonc
-{ "package": "opencode-tps-meter", "options": { "enabled": true, "live": true } }
+{
+  "package": "github:dhelgerson/opencode-tps-meter",
+  "options": { "enabled": true, "live": true },
+}
 ```
 
 - `enabled` — start with the badge hidden. The command palette's
