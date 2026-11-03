@@ -112,12 +112,15 @@ Add these to the plugin's entry in the config to change the defaults:
 - The badge is a `Slot` at `session.header`, rendered as a plain DOM node: plugin
   bundles are CommonJS with a fixed set of shared modules, so there is no JSX and
   no component framework beyond `solid-js` signals.
-- The TUI readout is a `prompt.footer.status` slot — a `solid-js` text node in
-  the theme's muted color — plus a `/tps` command. The measurement code is the
-  same pure functions in both files, kept duplicated on purpose so each file
-  stays loadable on its own with no build step. In the terminal the number has
-  no hover tooltip, and if the plugin's event subscription is unavailable the
-  live count degrades gracefully to polling the synced partial response.
+- The TUI readout is a `prompt.footer.status` slot — a text renderable in the
+  theme's muted color, built with the runtime's own `jsx()` — plus a `/tps`
+  command. No JSX syntax in the source on purpose: installed packages load
+  from under `node_modules`, where the TUI's Solid JSX transform does not
+  apply. The measurement code is the same pure functions in both files, kept
+  duplicated so each file stays loadable on its own with no build step. In the
+  terminal the number has no hover tooltip, and if the plugin's event
+  subscription is unavailable the live count degrades gracefully to polling
+  the synced partial response.
 
 ## Zero-effort alternative
 

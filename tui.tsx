@@ -4,7 +4,8 @@
 // `./tui` entry of this plugin directory (or from a project `.opencode/plugins`
 // discovery folder) and runs the default export's `setup` in every TUI. It
 // only imports modules the TUI shares with plugin bundles
-// (`@opencode/plugin/tui` and `solid-js`), so there is nothing to build.
+// (`@opencode/plugin/tui`, `solid-js`, and `@opentui/solid/jsx-runtime`), and
+// avoids JSX syntax on purpose, so there is nothing to build.
 //
 // What it shows, in the status part of the footer under the prompt:
 //   - While a model writes: a live count. `session.text.delta` and
@@ -25,6 +26,7 @@
 
 import { Plugin } from "@opencode/plugin/tui"
 import { createSignal } from "solid-js"
+import { jsx } from "@opentui/solid/jsx-runtime"
 
 const CHARS_PER_TOKEN = 4
 const MIN_LIVE_CHARS = 240
@@ -355,7 +357,17 @@ export default Plugin.define({
           if (!row) return ""
           return format(row.rate[0]())
         }
-        return <text fg={ctx.theme.text.muted}>{label()}</text>
+        // Deliberately no JSX: installed package plugins live under
+        // node_modules, where the TUI's Solid JSX transform does not apply and
+        // the fallback transpiler would emit `react` imports. Calling the
+        // runtime's own jsx() keeps this file loadable everywhere, with only
+        // specifiers the plugin runtime maps.
+        return jsx("text", {
+          fg: ctx.theme.text.muted,
+          get children() {
+            return label()
+          },
+        })
       },
     })
 
