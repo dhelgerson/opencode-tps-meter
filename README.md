@@ -1,15 +1,16 @@
 # opencode-tps-meter
 
-A tokens-per-second readout for OpenCode Desktop. It adds a small badge to every
-session header: `142 t/s` while the model writes, and the exact rate once the turn
-settles. Hover it for the token count and seconds behind the number.
+A tokens-per-second readout for OpenCode Desktop **and the terminal**. Desktop
+adds a small badge to every session header — `142 t/s` while the model writes,
+and the exact rate once the turn settles; hover it for the token count and
+seconds behind the number. The TUI shows the same number in the status part of
+the prompt footer, next to the path and cost.
 
-One file, no build step, no dependencies.
+Two self-contained files (one per surface), no build step, no dependencies.
 
 ## Install
 
-Requires OpenCode Desktop 2.x. (The badge is Desktop-only; the TUI shows
-nothing.) Ask an agent or yourself to run one command:
+Requires OpenCode 2.x. Ask an agent or yourself to run one command:
 
 ```sh
 opencode plugin add github:dhelgerson/opencode-tps-meter
@@ -31,16 +32,21 @@ snippet:
 ```
 
 The change is picked up as the config is watched; otherwise restart OpenCode
-Desktop.
+Desktop. The CLI needs no extra step: it loads the plugin's TUI part from the
+same `plugins` entry. To run the TUI half alone — or keep it active when the
+CLI connects to a remote server — list it under `plugins` in
+`~/.config/opencode/cli.json` instead.
 
-**Verify:** send any prompt — the session header should show `… t/s` while the
-model writes. If it does not, open **Settings ▸ Extensions ▸ Plugins** (with
+**Verify:** send any prompt — the session header (Desktop) or the prompt
+footer (TUI) should show `… t/s` while the model writes. If it does not, open
+**Settings ▸ Extensions ▸ Plugins** (with
 the app's own server selected): `opencode-tps-meter` must be listed and
 enabled; **Reload** re-reads it after an edit or a failure. A row saying
 "Failed" or "Not loaded" means the bundle or the id has a problem.
 
 For a local copy instead of a repository, point the same entry at the folder —
-a directory holding just `gui-experimental.cjs` is a complete package:
+a directory holding `gui-experimental.cjs` and `tui.tsx` beside this
+`package.json` is a complete package:
 
 ```jsonc
 { "plugins": ["/path/to/opencode-tps-meter"] }
@@ -86,7 +92,8 @@ Add these to the plugin's entry in the config to change the defaults:
 ```
 
 - `enabled` — start with the badge hidden. The command palette's
-  **Hide tokens per second** / **Show tokens per second** toggles it either way.
+  **Hide tokens per second** / **Show tokens per second** toggles it either way;
+  in the TUI, `/tps` does the same.
 - `live` — `false` shows only the settled number, and skips the extra event
   subscription the live count needs.
 
@@ -96,16 +103,25 @@ Add these to the plugin's entry in the config to change the defaults:
   carry each streamed fragment. The desktop app keeps one shared event stream per
   server; the plugin adds a filtered subscriber to it per open session with
   `session.server.client.event.subscribe({ types, signal })`, and closes the
-  subscriber with the signal when the session's tab closes.
+  subscriber with the signal when the session's tab closes. The TUI keeps one
+  filtered subscription with the same call on `context.client` and counts
+  fragments per session inside it.
 - Message data comes from the app's own synced store,
   `session.server.data.session.message.list(id)`, so the settled number needs no
   extra requests.
 - The badge is a `Slot` at `session.header`, rendered as a plain DOM node: plugin
   bundles are CommonJS with a fixed set of shared modules, so there is no JSX and
   no component framework beyond `solid-js` signals.
+- The TUI readout is a `prompt.footer.status` slot — a `solid-js` text node in
+  the theme's muted color — plus a `/tps` command. The measurement code is the
+  same pure functions in both files, kept duplicated on purpose so each file
+  stays loadable on its own with no build step. In the terminal the number has
+  no hover tooltip, and if the plugin's event subscription is unavailable the
+  live count degrades gracefully to polling the synced partial response.
 
 ## Zero-effort alternative
 
 OpenCode Desktop already ships a turn-average TPS readout: the command palette's
 **Toggle debug bar**. It is not live, and it takes over a strip at the bottom of
-the window, which is why this badge exists.
+the window, which is why this badge exists. The TUI's debug mode likewise prints
+the per-turn average (`… 2.3s · 136.6 tok/s`) under each response.
