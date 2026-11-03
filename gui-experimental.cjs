@@ -12,7 +12,9 @@
 //     `session.reasoning.delta` carry every streamed fragment, so the badge
 //     counts characters and converts them with a characters-per-token ratio
 //     taken from the token counts the server reports. Clock time only counts
-//     while characters arrive, so a long tool run does not drag the number down.
+//     while characters arrive, so a long tool run does not drag the number
+//     down. Without the event stream, the characters come from the synced
+//     lengths of the turn's messages instead.
 //   - Once the turn settles: the exact measure, `(output + reasoning) tokens /
 //     streamed seconds` over the turn's model requests, excluding tool time.
 //     That is the same measure the app's own debug bar computes.
@@ -28,6 +30,10 @@ const MIN_LIVE_MS = 600
 const ACTIVE_GAP = 1500
 const POLL_MS = 400
 const WATCH_MS = 1500
+const LIVE_RETRY_MS = 5000
+const MAX_LIVE_RATE = 1000
+const RATIO_MIN = 1.2
+const RATIO_MAX = 8
 const LIVE_TYPES = ["session.text.delta", "session.reasoning.delta"]
 const TURN_TYPES = [
   "session.execution.succeeded",
@@ -70,6 +76,14 @@ function outTokens(message) {
   return (tokens.output || 0) + (tokens.reasoning || 0)
 }
 
+// The learned characters-per-token ratio, bounded: code sits near 2 and prose
+// near 4, so a value far outside that band is a counting error rather than the
+// model's doing, and the default ratio stays in charge instead.
+function clampedRatio(value) {
+  if (!(value >= RATIO_MIN) || value > RATIO_MAX) return
+  return value
+}
+
 // The exact rate for the turn of `index`, with the characters counted live for
 // it, so the ratio used while streaming is a real one.
 function turnMeasure(messages, index, characters) {
@@ -90,25 +104,40 @@ function turnMeasure(messages, index, characters) {
     tokens: tokens,
     seconds: streamed / 1000,
     rate: tokens / (streamed / 1000),
-    ratio: characters > 200 ? characters / tokens : undefined,
+    ratio: characters > 200 ? clampedRatio(characters / tokens) : undefined,
   }
 }
 
 function latestAssistant(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) if (messages[i].type === "assistant") return messages[i]
+  for (let i = messages.length - 1; i >= 0; i--) if (messages[i].type === "assistant") return i
+  return -1
 }
 
-// The assistant message the model is still writing, if any.
-function streamingMessage(messages) {
-  const message = latestAssistant(messages)
-  if (!message || isTerminal(message)) return
-  return message
+// The index of the assistant message the model is still writing, if any.
+function streamingIndex(messages) {
+  const index = latestAssistant(messages)
+  if (index === -1 || isTerminal(messages[index])) return -1
+  return index
 }
 
 function contentLength(message) {
   let total = 0
   for (const block of message.content || []) {
     if (block.type === "text" || block.type === "reasoning") total += (block.text || "").length
+  }
+  return total
+}
+
+// Everything the turn has written, whether or not the delta stream is alive:
+// the finished assistant messages after the prompt boundary, plus the partial
+// one still being written. A tool-heavy turn streams many short messages, and
+// counting only the running one made the learned ratio far too small, which
+// multiplied every later live estimate.
+function turnLength(messages, start, index) {
+  let total = 0
+  for (let i = start + 1; i <= index; i++) {
+    const message = messages[i]
+    if (message.type === "assistant") total += contentLength(message)
   }
   return total
 }
@@ -139,6 +168,13 @@ function liveSeconds(row) {
   const now = Date.now()
   const open = now - row.lastChar < ACTIVE_GAP ? now - row.lastChar : 0
   return Math.max(0.3, (row.active + open) / 1000)
+}
+
+// The live estimate, kept under a plausibility ceiling. Characters arrive in
+// bursts and one bad ratio could otherwise multiply a whole session's numbers;
+// no model streams anywhere near this fast.
+function liveRate(row) {
+  return Math.min(row.chars / ratio(row) / liveSeconds(row), MAX_LIVE_RATE)
 }
 
 function tip(row) {
@@ -188,6 +224,7 @@ exports.default = Plugin.define({
         rate: undefined,
         settled: -1,
         prompt: -1,
+        liveRetryAt: 0,
         stopLive: undefined,
         stopTurns: [],
         timer: undefined,
@@ -229,7 +266,7 @@ exports.default = Plugin.define({
       }
     }
 
-    // Take in a character count for the message being written, and spend
+    // Take in a character count for the turn being written, and spend
     // clock time only while that count grows.
     function count(row, chars) {
       if (chars <= row.chars) return
@@ -260,15 +297,15 @@ exports.default = Plugin.define({
         reset(row)
       }
 
-      const running = streamingMessage(messages)
-      if (running) {
-        count(row, Math.max(contentLength(running), row.deltaChars))
+      const running = streamingIndex(messages)
+      if (running !== -1) {
+        count(row, Math.max(turnLength(messages, prompt, running), row.deltaChars))
         row.live = true
         const known = row.measured ? row.measured.rate : undefined
         // The first fragment tells nothing yet, and one large synced chunk
         // divided by a sliver of clock would be a wild number: wait until the
         // turn has written a little and the clock has actually been watched.
-        row.rate = row.chars < MIN_LIVE_CHARS || row.active < MIN_LIVE_MS ? known : row.chars / ratio(row) / liveSeconds(row)
+        row.rate = row.chars < MIN_LIVE_CHARS || row.active < MIN_LIVE_MS ? known : liveRate(row)
         poll(row, true)
         return
       }
@@ -284,7 +321,7 @@ exports.default = Plugin.define({
       if (row.live && row.chars > 0) {
         // Streaming stopped just before the turn settled: keep the best number
         // available instead of falling back to the previous turn.
-        row.rate = row.chars / ratio(row) / liveSeconds(row)
+        row.rate = liveRate(row)
         row.live = false
       }
     }
@@ -294,12 +331,19 @@ exports.default = Plugin.define({
     // `subscribe` filters it in place. Pass the signal inside the options
     // object: the promise client's `subscribe` takes one argument, and the
     // signal is what releases this subscriber when the session closes.
+    // A stream that fails or ends on its own is reopened by the watchdog, so a
+    // server restart does not leave the badge on the fallback for good.
     function openLive(row, session) {
       const client = session.server && session.server.client
-      if (!showLive || row.stopLive || !client || !client.event || typeof client.event.subscribe !== "function") return
+      if (!showLive || row.stopLive || Date.now() < row.liveRetryAt) return
+      if (!client || !client.event || typeof client.event.subscribe !== "function") return
+      row.liveRetryAt = Date.now() + LIVE_RETRY_MS
       const controller = new AbortController()
       let stopped = false
       let source
+      const settle = () => {
+        if (!stopped) row.stopLive = undefined
+      }
       try {
         source = client.event.subscribe({ types: LIVE_TYPES, signal: controller.signal })
       } catch (error) {
@@ -322,22 +366,23 @@ exports.default = Plugin.define({
             if (typeof event.data.delta !== "string") continue
             // Deltas only carry the newest fragment, so they are summed on
             // their own and `read` keeps whichever count is larger: this
-            // stream's sum or the part the app has already synced. `read` then
-            // runs on the poll, not per fragment: rescanning the synced
-            // messages for every arriving character grows quadratically with
-            // the response and can outrun the stream's event capacity.
+            // stream's sum or the turn length the app has already synced.
+            // `read` then runs on the poll, not per fragment: rescanning the
+            // synced messages for every arriving character grows quadratically
+            // with the response and can outrun the stream's event capacity.
             row.deltaChars += event.data.delta.length
             row.live = true
             bump()
           }
         } catch (error) {
-          // The stream ends when its server restarts; the next mount of this
-          // session opens a new one.
+          // The stream ends when its server restarts; the watchdog opens a
+          // new one while the session stays open.
         }
+        settle()
       }
       // Older clients hand back a promise of the stream, newer ones the stream.
       const started = source && typeof source.then === "function" ? source.then(consume) : consume(source)
-      if (started && typeof started.catch === "function") started.catch(() => {})
+      if (started && typeof started.catch === "function") started.catch(settle)
     }
 
     function watch(row, session) {
@@ -369,9 +414,13 @@ exports.default = Plugin.define({
       bump()
     })
 
-    // Cheap safety net: recompute even when an event is missed.
+    // Cheap safety net: recompute even when an event is missed, and reopen a
+    // dead event stream.
     const watchdog = setInterval(() => {
-      for (const row of rows.values()) read(row)
+      for (const row of rows.values()) {
+        openLive(row, row.session)
+        read(row)
+      }
       bump()
     }, WATCH_MS)
 

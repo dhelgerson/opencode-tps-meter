@@ -119,8 +119,10 @@ Add these to the plugin's entry in the config to change the defaults:
   apply. The measurement code is the same pure functions in both files, kept
   duplicated so each file stays loadable on its own with no build step. In the
   terminal the number has no hover tooltip, and if the plugin's event
-  subscription is unavailable the live count degrades gracefully to polling
-  the synced partial response.
+  subscription is unavailable the live count degrades gracefully to the synced
+  lengths of the turn's messages. A learned ratio far outside 1.2–8 characters
+  per token is treated as a counting error and ignored, and the live estimate
+  is capped at a plausibility ceiling.
 
 ## Zero-effort alternative
 

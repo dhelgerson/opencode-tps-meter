@@ -13,8 +13,8 @@
 //     counts characters and converts them with a characters-per-token ratio
 //     taken from the token counts the server reports. Clock time only counts
 //     while characters arrive, so a long tool run does not drag the number
-//     down. When the event stream is unavailable, the number falls back to the
-//     length of the partial assistant message in the synced store.
+//     down. When the event stream is unavailable, the count falls back to the
+//     synced lengths of the turn's messages.
 //   - Once the turn settles: the exact measure, `(output + reasoning) tokens /
 //     streamed seconds` over the turn's model requests, excluding tool time.
 //     That is the same measure the desktop badge and the debug bar compute.
@@ -34,6 +34,10 @@ const MIN_LIVE_MS = 600
 const ACTIVE_GAP = 1500
 const POLL_MS = 400
 const WATCH_MS = 1500
+const LIVE_RETRY_MS = 5000
+const MAX_LIVE_RATE = 1000
+const RATIO_MIN = 1.2
+const RATIO_MAX = 8
 const LIVE_TYPES = ["session.text.delta", "session.reasoning.delta"]
 const TURN_TYPES = [
   "session.execution.succeeded",
@@ -76,6 +80,14 @@ function outTokens(message) {
   return (tokens.output || 0) + (tokens.reasoning || 0)
 }
 
+// The learned characters-per-token ratio, bounded: code sits near 2 and prose
+// near 4, so a value far outside that band is a counting error rather than the
+// model's doing, and the default ratio stays in charge instead.
+function clampedRatio(value) {
+  if (!(value >= RATIO_MIN) || value > RATIO_MAX) return
+  return value
+}
+
 // The exact rate for the turn of `index`, with the characters counted live for
 // it, so the ratio used while streaming is a real one.
 function turnMeasure(messages, index, characters) {
@@ -96,7 +108,7 @@ function turnMeasure(messages, index, characters) {
     tokens: tokens,
     seconds: streamed / 1000,
     rate: tokens / (streamed / 1000),
-    ratio: characters > 200 ? characters / tokens : undefined,
+    ratio: characters > 200 ? clampedRatio(characters / tokens) : undefined,
   }
 }
 
@@ -120,6 +132,20 @@ function contentLength(message) {
   return total
 }
 
+// Everything the turn has written, whether or not the delta stream is alive:
+// the finished assistant messages after the prompt boundary, plus the partial
+// one still being written. A tool-heavy turn streams many short messages, and
+// counting only the running one made the learned ratio far too small, which
+// multiplied every later live estimate.
+function turnLength(messages, start, index) {
+  let total = 0
+  for (let i = start + 1; i <= index; i++) {
+    const message = messages[i]
+    if (message.type === "assistant") total += contentLength(message)
+  }
+  return total
+}
+
 function format(value) {
   if (!(value > 0) || !Number.isFinite(value)) return ""
   return (value >= 100 ? String(Math.round(value)) : value.toFixed(1)) + " t/s"
@@ -136,6 +162,13 @@ function liveSeconds(row) {
   const now = Date.now()
   const open = now - row.lastChar < ACTIVE_GAP ? now - row.lastChar : 0
   return Math.max(0.3, (row.active + open) / 1000)
+}
+
+// The live estimate, kept under a plausibility ceiling. Characters arrive in
+// bursts and one bad ratio could otherwise multiply a whole session's numbers;
+// no model streams anywhere near this fast.
+function liveRate(row) {
+  return Math.min(row.chars / ratio(row) / liveSeconds(row), MAX_LIVE_RATE)
 }
 
 export default Plugin.define({
@@ -195,7 +228,7 @@ export default Plugin.define({
       }
     }
 
-    // Take in a character count for the message being written, and spend
+    // Take in a character count for the turn being written, and spend
     // clock time only while that count grows.
     function count(row, chars) {
       if (chars <= row.chars) return
@@ -232,13 +265,13 @@ export default Plugin.define({
 
       const running = streamingIndex(messages)
       if (running !== -1) {
-        count(row, Math.max(contentLength(messages[running]), row.deltaChars))
+        count(row, Math.max(turnLength(messages, prompt, running), row.deltaChars))
         row.live = true
         const known = row.measured ? row.measured.rate : undefined
         // The first fragment tells nothing yet, and one large synced chunk
         // divided by a sliver of clock would be a wild number: wait until the
         // turn has written a little and the clock has actually been watched.
-        setRate(row, row.chars < MIN_LIVE_CHARS || row.active < MIN_LIVE_MS ? known : row.chars / ratio(row) / liveSeconds(row))
+        setRate(row, row.chars < MIN_LIVE_CHARS || row.active < MIN_LIVE_MS ? known : liveRate(row))
         poll(row, true)
         return
       }
@@ -254,7 +287,7 @@ export default Plugin.define({
       if (row.live && row.chars > 0) {
         // Streaming stopped just before the turn settled: keep the best number
         // available instead of falling back to the previous turn.
-        setRate(row, row.chars / ratio(row) / liveSeconds(row))
+        setRate(row, liveRate(row))
         row.live = false
       }
     }
@@ -263,15 +296,24 @@ export default Plugin.define({
     // are ephemeral events; the plugin adds one filtered subscription to the
     // server's event stream and counts fragments per session. Deltas only
     // carry the newest fragment, so they are summed on their own and `read`
-    // keeps whichever count is larger: this stream's sum or the part the TUI
-    // has already synced. `read` then runs on the poll, not per fragment:
-    // rescanning the synced messages for every arriving character grows
-    // quadratically with the response.
+    // keeps whichever count is larger: this stream's sum or the turn length
+    // the TUI has already synced. `read` then runs on the poll, not per
+    // fragment: rescanning the synced messages for every arriving character
+    // grows quadratically with the response.
+    // A stream that fails or ends on its own is reopened by the watchdog, so a
+    // server restart does not leave the live count on the fallback for good.
     let stopLive
-    if (showLive && ctx.client && ctx.client.event && typeof ctx.client.event.subscribe === "function") {
+    let liveRetryAt = 0
+    function openLive() {
+      if (!showLive || stopLive || Date.now() < liveRetryAt) return
+      if (!ctx.client || !ctx.client.event || typeof ctx.client.event.subscribe !== "function") return
+      liveRetryAt = Date.now() + LIVE_RETRY_MS
       try {
         const controller = new AbortController()
         let stopped = false
+        const settle = () => {
+          if (!stopped) stopLive = undefined
+        }
         const source = ctx.client.event.subscribe({ types: LIVE_TYPES, signal: controller.signal })
         stopLive = () => {
           stopped = true
@@ -293,17 +335,19 @@ export default Plugin.define({
               row.live = true
             }
           } catch (error) {
-            // The stream ends when its server restarts; the next TUI start
-            // opens a new one.
+            // The stream ends when its server restarts; the watchdog opens a
+            // new one while the TUI lives.
           }
+          settle()
         }
         // Older clients hand back a promise of the stream, newer ones the stream.
         const started = source && typeof source.then === "function" ? source.then(consume) : consume(source)
-        if (started && typeof started.catch === "function") started.catch(() => {})
+        if (started && typeof started.catch === "function") started.catch(settle)
       } catch (error) {
-        stopLive = undefined
+        // Left unsubscribed; the watchdog tries again after the retry window.
       }
     }
+    openLive()
 
     // Settle the exact number on the events that end a step or a turn.
     let stopTurns
@@ -323,9 +367,11 @@ export default Plugin.define({
       }
     }
 
-    // Cheap safety net: recompute even when an event is missed, and start the
-    // fast poll for a session that just began streaming.
+    // Cheap safety net: recompute even when an event is missed, start the fast
+    // poll for a session that just began streaming, and reopen a dead event
+    // stream.
     const watchdog = setInterval(() => {
+      openLive()
       for (const row of rows.values()) read(row)
     }, WATCH_MS)
 
